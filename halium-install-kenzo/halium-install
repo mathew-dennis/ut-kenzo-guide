@@ -1,0 +1,180 @@
+#!/bin/bash
+#
+# Halium installer script
+# =======================
+#
+# Copyright (C) 2017 JBBgameich
+# Copyright (C) 2017 TheWiseNerd
+#
+# License: GPLv3
+#
+# dependencies: qemu binfmt-support qemu-user-static e2fsprogs sudo simg2img
+
+set -e # terminate on errors
+
+LOCATION="$(dirname "$(readlink -f "$0")")"
+
+# Defaults
+export ROOTFS_RELEASE="none"
+export INSTALL_MODE="img"
+export DO_COPY_SSH_KEY=false
+export SSH_KEY=~/.ssh/id_rsa.pub
+export DO_ZIP=false
+export SYSTEM_AS_ROOT=false
+
+# create file descriptor 4 and redirect to /dev/null
+exec 4> /dev/null
+# functions below are executed like this:
+#   do_something param1 param2 >&4 2>&1
+# >&4 means standard output of do_something() is redirected to file descriptor 4, and
+# 2>&1 means, afterwards standard error is redirected to standard out, i.e., also fd 4
+# so, by default we see neither std out nor std err of the function.
+# the commandline option -v changes file descriptor 4 to be the actual standard output
+
+# Include functions
+source "$LOCATION/functions/misc.sh"
+
+# parse options
+while [ -n "$1" ] ; do
+	case "$1" in
+	"-p")
+		shift
+		export ROOTFS_RELEASE="$1"
+		case $ROOTFS_RELEASE in
+		"halium" | "debian-pm" | "reference" | "debian-pm-caf" | "pm" | "neon" | "ut" | "none")
+			;;
+		*)
+			echo "Unsupported post install release! Exiting now"
+			exit 1
+			;;
+		esac
+		;;
+	"-m" | "--mode")
+		shift
+		export INSTALL_MODE="$1"
+		case $INSTALL_MODE in
+		"img" | "dir" )
+			;;
+		*)
+			echo "Unsupported install mode! Exiting now"
+			exit 1
+			;;
+		esac
+		;;
+	"-u")
+		shift
+		USERPASSWORD="$1"
+		;;
+	"-r")
+		shift
+		ROOTPASSWORD="$1"
+		;;
+	"-i")
+		DO_COPY_SSH_KEY=true
+		;;
+	"-v")
+		exec 4>&1 # redirect file descriptor 4 to stdout (1)
+		;;
+	"-tm" | "--test-mode")
+		# provides an internal test mode
+		TEST_MODE=true
+		;;
+	"-z")
+		DO_ZIP=true
+		;;
+	"-s" | "--system-as-root")
+		SYSTEM_AS_ROOT=true
+		;;
+	*)
+		break
+		;;
+	esac
+	shift
+done
+
+# parse positional parameters
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+	usage
+	exit
+fi
+
+export ROOTFS_TAR="$1"
+export AND_IMAGE="$2"
+if [ ! -f "$ROOTFS_TAR" ] || [ ! -f "$AND_IMAGE" ]; then
+	usage
+	exit
+fi
+
+# Check for missing dependencies
+if ! init_checks; then
+	exit
+fi
+
+export ROOTFS_DIR="${ROOTFS_DIR:-$(mktemp -d .halium-install-rootfs.XXXXX)}"
+export IMAGE_DIR="${IMAGE_DIR:-$(mktemp -d .halium-install-imgs.XXXXX)}"
+
+# Logic that depends on the opts being parsed
+source "$LOCATION/functions/distributions.sh"
+source "$LOCATION/functions/core.sh"
+
+# Always enforce cleanup on exit
+if [ -z ${TEST_MODE} ]; then
+	trap clean_exit EXIT
+fi
+
+# Start installer
+echo "D: Chosen rootfs is $ROOTFS_TAR"
+echo "D: Chosen android image is $AND_IMAGE"
+echo "D: Chosen release is $ROOTFS_RELEASE"
+echo "D: Compress images before pushing: $DO_ZIP"
+echo
+
+case "$INSTALL_MODE" in
+"img")
+	echo "I: Writing rootfs into mountable image"
+	convert_rootfs_to_img $IMAGE_SIZE >&4 2>&1
+	;;
+"dir")
+	echo "I: Extracting rootfs"
+	convert_rootfs_to_dir >&4 2>&1
+	;;
+esac
+
+echo "I: Writing android image into mountable image"
+convert_androidimage >&4 2>&1
+
+echo "I: Running post installation tasks"
+post_install $ROOTFS_RELEASE
+
+echo "I: Shrinking images"
+shrink_images
+
+case "$INSTALL_MODE" in
+"img")
+	# In dir mode, nothing is being mounted, so unmount would fail
+	echo "I: Unmounting images"
+	unmount
+	;;
+"dir")
+	echo "I: Injecting android image into rootfs"
+	inject_androidimage
+	;;
+esac
+
+if [ -z ${TEST_MODE} ]; then
+	case "$INSTALL_MODE" in
+	"img")
+		echo "I: Pushing rootfs and android image to /data via ADB"
+		if ! time flash_img; then
+			echo "Error: Couldn't copy the files to the device, is it connected?"
+		fi
+		;;
+	"dir")
+		echo "I: Pushing rootfs and android image to /data via ADB"
+		if ! flash_dir; then
+			echo "Error: Couldn't copy the files to the device, is it connected?"
+		fi
+		;;
+	esac
+fi
+
